@@ -856,11 +856,11 @@ async def execute_task_job(account_key: str, task_id: str, trigger_type: str = "
                 log_output += f"[{time_service.format_now()}] 预热奖池探测异常: {e}\n"
 
             if can_burst:
-                # 针对大牌券设置 early_ms=0 精准整点开火 (避免整点前提前发射导致撞在未开闸状态 40021 或触发网关频控 50008)
+                # 提前 300ms 起跑抢券，之后每 100ms 补枪一次，共 6 次压枪
                 warmup_msg = await prepare_warmup_and_wait(
                     target_hour=9, target_minute=30, token=token,
                     silk_id=silk_id, user_id=user_id, city_code=city_code,
-                    early_ms=0, trigger_type=trigger_type
+                    early_ms=300, trigger_type=trigger_type
                 )
                 if warmup_msg:
                     log_output += warmup_msg
@@ -873,8 +873,17 @@ async def execute_task_job(account_key: str, task_id: str, trigger_type: str = "
                 grab_success = False
                 last_err_code = 0
 
-                # 毫秒级整点零等待直射开火 (Zero-latency Burst - 4次高频压枪)
-                for try_idx in range(1, 5):
+                # 提前 300ms 起跑，按 100ms 节奏连续压枪 6 次 (开火时刻: -300ms / -200ms / -100ms / 0ms / +100ms / +200ms)
+                last_fire_ts = 0.0
+                for try_idx in range(1, 7):
+                    fire_ts = flash_target_ts - 0.3 + (try_idx - 1) * 0.1
+                    # 迟到或单次响应耗时超 100ms 时，保证相邻两次请求起点至少间隔 100ms
+                    if try_idx > 1 and fire_ts < last_fire_ts + 0.1:
+                        fire_ts = last_fire_ts + 0.1
+                    rem_sec = fire_ts - time_service.now_ts()
+                    if rem_sec > 0:
+                        await asyncio.sleep(rem_sec)
+                    last_fire_ts = time_service.now_ts()
                     ts_fmt = time_service.format_now_ms()
                     try:
                         grab_res = await client.grab_extra_brand_card(token=token, silk_id=silk_id, user_id=user_id, city_code=city_code, card_type=pool_type)
@@ -900,11 +909,8 @@ async def execute_task_job(account_key: str, task_id: str, trigger_type: str = "
                             break
 
                         now_ts = time_service.now_ts()
-                        # 若当前时间尚未到达目标整点，即便返回 40021 也是因为服务端尚未开闸，严禁提前终止退出！
-                        if e.code == 40021 and now_ts < flash_target_ts:
-                            wait_rem = flash_target_ts - now_ts
-                            if wait_rem > 0:
-                                await asyncio.sleep(wait_rem + 0.005)
+                        # 压枪窗口内 (提前 300ms 至整点后 200ms) 返回 40021 说明服务端尚未开闸或瞬时无库存，保持 100ms 节奏继续补枪，严禁提前终止退出！
+                        if e.code == 40021 and now_ts < flash_target_ts + 0.25:
                             continue
 
                         # 遭遇网关频控 50008 时，退避 80ms 后立即重发，避开滑动窗口硬碰撞并抢占余量
@@ -916,7 +922,6 @@ async def execute_task_job(account_key: str, task_id: str, trigger_type: str = "
                             break
                     except Exception as e:
                         log_output += f"[{ts_fmt}] [抢每日大牌券] 第{try_idx}次请求异常: {e}\n"
-                    await asyncio.sleep(0.06)
 
                 # 抢后账面与奖池状态权威复核：
                 # 当首包极速命中但网关/并发碰撞返回 50008，而 500ms 后二次重试时奖池已空返回 40021 (官方优先校验奖池总库存而非个人已领状态)，
